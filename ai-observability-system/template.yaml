@@ -1,0 +1,247 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AI-Ready Observability System
+
+Resources:
+
+  # ---------------------------
+  # DynamoDB Table
+  # ---------------------------
+  AlertDataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ObservabilityAlertData
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: alert_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: alert_id
+          KeyType: HASH
+
+  # ---------------------------
+  # SNS Topic
+  # ---------------------------
+  MySNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: ObservabilityAlerts
+
+  # ---------------------------
+  # SQS Queue
+  # ---------------------------
+  MySQSQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: ObservabilityQueue
+
+  # ---------------------------
+  # SNS to SQS Subscription
+  # ---------------------------
+  SNSToSQSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref MySNSTopic
+      Protocol: sqs
+      Endpoint: !GetAtt MySQSQueue.Arn
+      RawMessageDelivery: true
+
+  # ---------------------------
+  # SQS Policy (Secure)
+  # ---------------------------
+  QueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref MySQSQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: sqs:SendMessage
+            Resource: !GetAtt MySQSQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref MySNSTopic
+
+  # ---------------------------
+  # IAM Role for Lambda
+  # ---------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaSQSExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+
+              # SQS Permissions
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt MySQSQueue.Arn
+
+              # DynamoDB Write
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt AlertDataTable.Arn
+
+              # CloudWatch Logs
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # ---------------------------
+  # Lambda Function
+  # ---------------------------
+  MyLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ObservabilityProcessor
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          from datetime import datetime
+          from decimal import Decimal
+
+          # Connect to DynamoDB
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table('ObservabilityAlertData')
+
+          def lambda_handler(event, context):
+              """
+              Main Lambda function triggered by SQS messages.
+              Processes CloudWatch alarm notifications and stores them in DynamoDB.
+              """
+
+              # Loop through all messages in the batch
+              for record in event['Records']:
+                  try:
+                      # Step 1: Parse the message body from SQS
+                      body = json.loads(record['body'])
+                      print("Received Message:", body)
+
+                      message = body
+
+                      # Step 2: Extract Trigger details (metric info)
+                      trigger = message.get('Trigger', {})
+                      dimensions = trigger.get('Dimensions', [])
+
+                      # Step 3: Find the EC2 Instance ID from dimensions
+                      instance_id = None
+                      for dim in dimensions:
+                          if dim['name'] == 'InstanceId':
+                              instance_id = dim['value']
+                              break
+
+                      # Step 4: Extract the reason message
+                      reason = message.get('NewStateReason', "")
+
+                      # Step 5: Extract actual CPU value from reason string
+                      # Example reason: "Threshold Crossed: 3 datapoints [54.32 (01/04/22 10:00:00)]"
+                      actual_value = 0.0
+                      try:
+                          actual_value = float(reason.split("[")[1].split(" ")[0])
+                      except Exception:
+                          # If parsing fails, default to 0.0
+                          actual_value = 0.0
+
+                      # Step 6: Convert to Decimal (required for DynamoDB)
+                      actual_value = Decimal(str(actual_value))
+                      threshold = Decimal(str(trigger.get('Threshold', 0)))
+
+                      # Step 7: Build the item to store in DynamoDB
+                      item = {
+                          "alert_id":     str(uuid.uuid4()),           # Unique ID for each alert
+                          "alarm_name":   message.get('AlarmName'),    # Name of the CloudWatch alarm
+                          "metric_name":  trigger.get('MetricName'),   # e.g. CPUUtilization
+                          "instance_id":  instance_id,                  # EC2 instance that triggered alarm
+                          "threshold":    threshold,                    # Alarm threshold value (e.g. 70)
+                          "actual_value": actual_value,                 # Actual CPU value at alarm time
+                          "state":        message.get('NewStateValue'), # ALARM or OK
+                          "region":       message.get('Region'),        # AWS region
+                          "timestamp":    message.get('StateChangeTime'), # When alarm triggered
+                          "ingested_at":  datetime.utcnow().isoformat()  # When Lambda processed it
+                      }
+
+                      # Step 8: Save item to DynamoDB
+                      table.put_item(Item=item)
+                      print("Successfully stored alert:", item)
+
+                  except Exception as e:
+                      # Log error but continue processing other messages
+                      print("Error processing record:", str(e))
+
+  # ---------------------------
+  # SQS to Lambda Mapping
+  # ---------------------------
+  SQSLambdaMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt MySQSQueue.Arn
+      FunctionName: !Ref MyLambdaFunction
+      BatchSize: 10
+      Enabled: true
+
+  # ---------------------------
+  # CloudWatch Alarm
+  # NOTE: Replace the InstanceId value below with your actual EC2 Instance ID!
+  # ---------------------------
+  CPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: CPU exceeds 70%
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: InstanceId
+          Value: i-0b51f9671197a0fe7 # <-- REPLACE WITH YOUR EC2 INSTANCE ID!
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 70
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref MySNSTopic
+
+# ---------------------------
+# Outputs (shown after deployment)
+# ---------------------------
+Outputs:
+  SNSTopic:
+    Description: SNS Topic ARN
+    Value: !Ref MySNSTopic
+
+  SQSQueue:
+    Description: SQS Queue URL
+    Value: !Ref MySQSQueue
+
+  DynamoDBTable:
+    Description: DynamoDB Table Name
+    Value: !Ref AlertDataTable
+
+  LambdaFunction:
+    Description: Lambda Function Name
+    Value: !Ref MyLambdaFunction
